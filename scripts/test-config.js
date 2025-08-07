@@ -1,8 +1,11 @@
 const { Web3, utils } = require('web3');
+const TelegramNotifier = require('../src/telegram-bot');
 require('dotenv').config();
-
 async function testConfig() {
   console.log('🔍 测试钱包监控配置...\n');
+  
+  // 初始化电报通知
+  const telegram = new TelegramNotifier();
 
   // 检查环境变量
   console.log('📋 环境变量检查:');
@@ -26,6 +29,7 @@ async function testConfig() {
 
   if (!allVarsPresent) {
     console.log('\n❌ 请检查 .env 文件，确保所有必需的环境变量都已设置');
+    await telegram.sendError('配置测试失败：缺少必需的环境变量');
     return;
   }
 
@@ -49,6 +53,7 @@ async function testConfig() {
     }
   } catch (error) {
     console.log(`❌ RPC连接失败: ${error.message}`);
+    await telegram.sendError(`配置测试失败：RPC连接失败 - ${error.message}`);
     return;
   }
 
@@ -92,6 +97,9 @@ async function testConfig() {
 
   console.log('\n🎯 测试完成!');
   console.log('如果所有检查都通过，可以运行 "npm start" 启动监控');
+  
+  // 发送测试完成通知
+  await telegram.sendSuccess('配置测试完成！所有检查都通过，可以启动监控程序');
 }
 
 testConfig().catch(console.error); 

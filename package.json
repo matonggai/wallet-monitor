@@ -7,15 +7,19 @@
     "start": "node monitor.js",
     "dev": "nodemon monitor.js",
     "test-config": "node test-config.js",
-    "test-sepolia": "node sepolia-test.js"
+    "test-sepolia": "node sepolia-test.js",
+    "test-telegram": "node test-telegram.js",
+    "setup-telegram": "node setup-telegram.js"
   },
   "dependencies": {
-    "web3": "^4.0.1",
     "dotenv": "^16.0.3",
+    "node-telegram-bot-api": "^0.64.0",
+    "web3": "^4.0.1",
     "winston": "^3.8.2"
   },
   "devDependencies": {
-    "nodemon": "^2.0.22"
+    "nodemon": "^2.0.22",
+    "undici": "^7.11.0"
   },
   "keywords": [
     "ethereum",
@@ -25,4 +29,4 @@
   ],
   "author": "",
   "license": "MIT"
-} 
+}

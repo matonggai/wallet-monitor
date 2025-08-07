@@ -1,5 +1,6 @@
 const { Web3, utils } = require('web3');
 const winston = require('winston');
+const TelegramNotifier = require('./telegram-bot');
 require('dotenv').config();
 
 // 配置日志
@@ -22,7 +23,11 @@ const logger = winston.createLogger({
 
 class WalletMonitor {
   constructor() {
-    this.web3 = new Web3(process.env.RPC_URL);
+    this.rpcUrls = [process.env.RPC_URL].filter(Boolean);
+    if (process.env.RPC_URL_1) this.rpcUrls.push(process.env.RPC_URL_1);
+    if (process.env.RPC_URL_2) this.rpcUrls.push(process.env.RPC_URL_2);
+    this.currentRpcIndex = 0;
+    this.web3 = new Web3(this.rpcUrls[this.currentRpcIndex]);
     this.compromisedAddress = process.env.COMPROMISED_WALLET_ADDRESS;
     this.safeAddress = process.env.SAFE_WALLET_ADDRESS;
     this.privateKey = process.env.COMPROMISED_WALLET_PRIVATE_KEY;
@@ -33,6 +38,13 @@ class WalletMonitor {
     
     this.lastBalance = '0';
     this.isProcessing = false;
+    this.lastBalanceStatus = null; // 记录上一次余额状态
+    this.transferHistory = [];
+    
+    // 电报通知
+    this.telegram = new TelegramNotifier();
+    this.startTime = new Date();
+    this.isRunning = true;
     
     this.validateConfig();
   }
@@ -66,12 +78,20 @@ class WalletMonitor {
     logger.info('Configuration validated successfully');
   }
 
+  async switchRpcProvider() {
+    this.currentRpcIndex = (this.currentRpcIndex + 1) % this.rpcUrls.length;
+    this.web3.setProvider(this.rpcUrls[this.currentRpcIndex]);
+    logger.warn(`切换到下一个RPC节点: ${this.rpcUrls[this.currentRpcIndex]}`);
+  }
+
   async getBalance(address) {
     try {
       const balance = await this.web3.eth.getBalance(address);
       return balance;
     } catch (error) {
       logger.error('Error getting balance:', error);
+      // 网络错误时自动切换RPC
+      await this.switchRpcProvider();
       throw error;
     }
   }
@@ -82,6 +102,7 @@ class WalletMonitor {
       return gasPrice;
     } catch (error) {
       logger.error('Error getting gas price:', error);
+      await this.switchRpcProvider();
       // 使用配置的gas价格作为备选
       return utils.toWei(this.gasPriceGwei.toString(), 'gwei');
     }
@@ -120,10 +141,25 @@ class WalletMonitor {
 
       logger.info(`Transaction successful: ${receipt.transactionHash}`);
       logger.info(`Transferred ${utils.fromWei(transferAmount.toString(), 'ether')} ETH`);
+
+      // 发送电报通知
+      await this.telegram.sendTransferNotification(
+        utils.fromWei(transferAmount.toString(), 'ether'),
+        receipt.transactionHash,
+        utils.fromWei((BigInt(transaction.gas) * BigInt(transaction.gasPrice)).toString(), 'ether')
+      );
+      // 记录转账历史
+      this.transferHistory.push({
+        amount: utils.fromWei(transferAmount.toString(), 'ether'),
+        txHash: receipt.transactionHash,
+        gasUsed: utils.fromWei((BigInt(transaction.gas) * BigInt(transaction.gasPrice)).toString(), 'ether'),
+        time: new Date().toLocaleString('zh-CN')
+      });
       
       return true;
     } catch (error) {
       logger.error('Error transferring ETH:', error);
+      await this.switchRpcProvider();
       return false;
     }
   }
@@ -149,6 +185,15 @@ class WalletMonitor {
         logger.info(`Balance sufficient for transfer: ${utils.fromWei(currentBalance, 'ether')} ETH`);
         logger.info(`Estimated gas cost: ${utils.fromWei(estimatedGasCost.toString(), 'ether')} ETH`);
         
+        // 余额充足，只有状态变化时才推送
+        if (this.lastBalanceStatus !== 'enough') {
+          await this.telegram.sendBalanceAlert(
+            utils.fromWei(currentBalance, 'ether'),
+            utils.fromWei(minRequiredBalance.toString(), 'ether')
+          );
+          this.lastBalanceStatus = 'enough';
+        }
+        
         // 立即转移所有ETH
         const success = await this.transferEth(this.safeAddress, currentBalance);
         
@@ -160,6 +205,14 @@ class WalletMonitor {
         }
       } else {
         logger.debug(`Balance insufficient for transfer: ${utils.fromWei(currentBalance, 'ether')} ETH (need at least ${utils.fromWei(minRequiredBalance.toString(), 'ether')} ETH)`);
+        // 余额不足，只有状态变化时才推送
+        if (this.lastBalanceStatus !== 'not_enough') {
+          await this.telegram.sendBalanceAlert(
+            utils.fromWei(currentBalance, 'ether'),
+            utils.fromWei(minRequiredBalance.toString(), 'ether')
+          );
+          this.lastBalanceStatus = 'not_enough';
+        }
       }
       
       this.lastBalance = currentBalance;
@@ -177,6 +230,17 @@ class WalletMonitor {
     logger.info(`Check interval: ${this.checkInterval}ms`);
     logger.info(`Minimum ETH amount: ${utils.fromWei(this.minEthAmount, 'ether')} ETH`);
 
+    // 发送启动通知
+    await this.telegram.sendStartupNotification({
+      compromisedAddress: this.compromisedAddress,
+      safeAddress: this.safeAddress,
+      checkInterval: this.checkInterval,
+      minEthAmount: utils.fromWei(this.minEthAmount, 'ether'),
+      rpcProvidersCount: 1,
+      maxRetries: 3,
+      retryDelay: 5000
+    });
+
     // 获取初始余额并立即检查是否需要转移
     try {
       this.lastBalance = await this.getBalance(this.compromisedAddress);
@@ -186,6 +250,7 @@ class WalletMonitor {
       await this.checkAndTransfer();
     } catch (error) {
       logger.error('Error getting initial balance:', error);
+      await this.telegram.sendError(`程序启动失败: ${error.message}`);
       process.exit(1);
     }
 
@@ -199,34 +264,83 @@ class WalletMonitor {
 }
 
 // 错误处理
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', async (error) => {
   logger.error('Uncaught Exception:', error);
+  
+  // 发送紧急通知
+  if (global.monitor && global.monitor.telegram) {
+    await global.monitor.telegram.sendShutdownNotification(`未捕获的异常: ${error.message}`);
+  }
+  
   process.exit(1);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', async (reason, promise) => {
   logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  
+  // 发送紧急通知
+  if (global.monitor && global.monitor.telegram) {
+    await global.monitor.telegram.sendShutdownNotification(`未处理的Promise拒绝: ${reason}`);
+  }
+  
   process.exit(1);
 });
 
 // 优雅关闭
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
   logger.info('Received SIGINT, shutting down gracefully...');
+  
+  if (global.monitor) {
+    global.monitor.isRunning = false;
+    await global.monitor.telegram.sendShutdownNotification('收到SIGINT信号，程序正常关闭');
+  }
+  
   process.exit(0);
 });
 
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   logger.info('Received SIGTERM, shutting down gracefully...');
+  
+  if (global.monitor) {
+    global.monitor.isRunning = false;
+    await global.monitor.telegram.sendShutdownNotification('收到SIGTERM信号，程序正常关闭');
+  }
+  
   process.exit(0);
 });
 
 // 启动监控器
 if (require.main === module) {
   const monitor = new WalletMonitor();
-  monitor.start().catch(error => {
-    logger.error('Failed to start monitor:', error);
-    process.exit(1);
+  global.monitor = monitor; // 设置全局变量以便错误处理时访问
+
+  // 注册/check命令
+  monitor.telegram.onCheckCommand(async (msg) => {
+    // 查询余额
+    let balance = '未知';
+    try {
+      balance = await monitor.getBalance(monitor.compromisedAddress);
+      balance = utils.fromWei(balance, 'ether');
+    } catch (e) {
+      balance = '查询失败';
+    }
+    // 格式化历史转账
+    let historyMsg = '';
+    if (monitor.transferHistory.length === 0) {
+      historyMsg = '暂无历史转账记录。';
+    } else {
+      historyMsg = monitor.transferHistory.map((item, idx) =>
+        `#${idx+1}\n金额: ${item.amount} ETH\n哈希: <code>${item.txHash}</code>\nGas: ${item.gasUsed} ETH\n时间: ${item.time}`
+      ).join('\n\n');
+    }
+    const reply = `\n<b>监控地址余额</b>\n<code>${monitor.compromisedAddress}</code>\n\n💰 当前余额: <b>${balance} ETH</b>\n\n<b>历史转账记录</b>\n${historyMsg}`;
+    await monitor.telegram.sendMessage(reply);
+  });
+
+  // 注册/status命令
+  monitor.telegram.onStatusCommand(async (msg) => {
+    const startTime = monitor.startTime ? new Date(monitor.startTime).toLocaleString('zh-CN') : '未知';
+    const reply = `\n<b>运行状态</b>\n\n监控地址: <code>${monitor.compromisedAddress}</code>\n安全地址: <code>${monitor.safeAddress}</code>\n启动时间: <b>${startTime}</b>\n`;
+    await monitor.telegram.sendMessage(reply);
   });
 }
-
-module.exports = WalletMonitor; 
